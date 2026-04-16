@@ -382,7 +382,9 @@ grep_wrapper() {
     # macOS system grep lacks -P; use ggrep (brew install grep) or perl as fallback
     if [[ "$OSTYPE" == "darwin"* ]] && ! is_command_available "ggrep"; then
       local pattern="$1"; shift
-      perl -ne 'print "$&\n" while /'"$pattern"'/g' "$@"
+      # Pass pattern via BEGIN+shift so shell quoting of ' or / in the pattern
+      # doesn't break the perl one-liner; use ! as delimiter to avoid / conflicts
+      perl -ne 'BEGIN{$p=shift}print "$&\n" while m!$p!g' "$pattern" "$@"
       return
     fi
     local grep_bin="grep"
@@ -1898,9 +1900,9 @@ fetch_twitch_client_id() {
   log "$LOG_INFO" "Fetching fresh Twitch Client ID from twitch.tv"
 
   page=$(curl -sf --compressed --max-time 10 -A "$USER_AGENT" "https://www.twitch.tv/") || return 1
-  client_id=$(echo "$page" | grep_wrapper --perl '"Client-ID":"?\K[a-z0-9]+')
-  [[ -z "$client_id" ]] && \
-    client_id=$(echo "$page" | grep_wrapper --perl 'clientId[=:]["'"'"']?\K[a-z0-9]+')
+  # "Client-ID": pattern hits a short false match; use clientId= which is reliable
+  # Require 10+ chars to reject any short false positives
+  client_id=$(echo "$page" | grep_wrapper --perl 'clientId[=:]["'"'"']?\K[a-z0-9]{10,}')
   [[ -z "$client_id" ]] && return 1
 
   TWITCH_CLIENT_ID="$client_id"
@@ -1963,8 +1965,8 @@ lookup_chatgpt() {
     return
   fi
 
-  # Statsig key may be stale — refresh and retry once
-  if ! is_status_string "$response" && fetch_chatgpt_statsig_key 2>/dev/null; then
+  # Statsig 4xx = bad key (not an IP block), so refresh on any failure
+  if fetch_chatgpt_statsig_key 2>/dev/null; then
     response=$(curl_wrapper POST "https://ab.chatgpt.com/v1/initialize" --ip-version "$ip_version" \
       --header "Statsig-Api-Key: $CHATGPT_STATSIG_API_KEY")
     process_json "$response" ".derived_fields.country"
@@ -1982,7 +1984,9 @@ fetch_netflix_token() {
   bundle_url=$(echo "$page" | grep_wrapper --perl '/app-[a-f0-9]+\.js')
   [[ -z "$bundle_url" ]] && return 1
 
-  bundle=$(curl -sf --compressed --max-time 15 "https://fast.com${bundle_url}") || return 1
+  bundle=$(curl -sf --compressed --max-time 15 \
+    -H "Referer: https://fast.com/" \
+    "https://fast.com${bundle_url}") || return 1
   token=$(echo "$bundle" | grep_wrapper --perl 'token:"\K[A-Za-z0-9+/=_-]+')
   [[ -z "$token" ]] && return 1
 
@@ -2004,8 +2008,8 @@ lookup_netflix() {
     fi
   fi
 
-  # Token may be stale — refresh from fast.com and retry once
-  if ! is_status_string "$response" && fetch_netflix_token 2>/dev/null; then
+  # fast.com 403 = bad token (it doesn't IP-block), so refresh on any failure
+  if fetch_netflix_token 2>/dev/null; then
     response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
     if is_valid_json "$response"; then
       process_json "$response" ".client.location.country"
@@ -2243,8 +2247,8 @@ lookup_netflix_cdn() {
     fi
   fi
 
-  # Token may be stale — refresh and retry once (reuses fetch_netflix_token)
-  if ! is_status_string "$response" && fetch_netflix_token 2>/dev/null; then
+  # fast.com 403 = bad token, so refresh on any failure
+  if fetch_netflix_token 2>/dev/null; then
     response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
     if is_valid_json "$response"; then
       process_json "$response" ".targets[0].location.country"
