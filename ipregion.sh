@@ -25,6 +25,10 @@ IPV6_ONLY=false
 PROXY_ADDR=""
 INTERFACE_NAME=""
 DEBUG=false
+NO_COLOR_MODE=false
+SERVICE_FILTER=""
+SPINNER_PROGRESS_FILE=""
+SPINNER_TOTAL=0
 
 RESULT_JSON=""
 ARR_PRIMARY=()
@@ -262,11 +266,19 @@ color() {
     *) code="$color_name" ;;
   esac
 
+  if [[ "$NO_COLOR_MODE" == true ]]; then
+    printf "%s" "$text"
+    return
+  fi
   printf "\033[%sm%s\033[0m" "$code" "$text"
 }
 
 bold() {
   local text="$1"
+  if [[ "$NO_COLOR_MODE" == true ]]; then
+    printf "%s" "$text"
+    return
+  fi
   printf "\033[1m%s\033[0m" "$text"
 }
 
@@ -322,6 +334,8 @@ Options:
   -6, --ipv6           Test only IPv6
   -p, --proxy ADDR     Use SOCKS5 proxy (format: host:port)
   -i, --interface IF   Use specified network interface (e.g. eth1)
+  -s, --service NAME   Query a single service by name (e.g. GOOGLE, NETFLIX)
+      --no-color       Disable colored output (also respects \$NO_COLOR env var)
 
 Examples:
   $SCRIPT_NAME                       # Check all services with default settings
@@ -335,6 +349,8 @@ Examples:
   $SCRIPT_NAME -j                    # Output result as JSON
   $SCRIPT_NAME -v                    # Enable verbose logging
   $SCRIPT_NAME -d                    # Enable debug and save full trace to file and upload it to 0x0.st
+  $SCRIPT_NAME -s NETFLIX            # Query only Netflix
+  $SCRIPT_NAME --no-color            # Disable colored output
 
 EOF
 }
@@ -710,6 +726,14 @@ parse_arguments() {
         log "$LOG_INFO" "Using interface: $INTERFACE_NAME"
         shift 2
         ;;
+      -s | --service)
+        SERVICE_FILTER="${2^^}"
+        shift 2
+        ;;
+      --no-color)
+        NO_COLOR_MODE=true
+        shift
+        ;;
       *)
         error_exit "Unknown option: $1"
         ;;
@@ -781,8 +805,25 @@ check_ip_interfaces() {
 
   log "$LOG_INFO" "Checking for IPv${version} interfaces"
 
-  if [[ -n $(ip -"${version}" addr show scope global 2>/dev/null) ]]; then
-    log "$LOG_INFO" "IPv${version} global interfaces found"
+  if is_command_available "ip"; then
+    if [[ -n $(ip -"${version}" addr show scope global 2>/dev/null) ]]; then
+      log "$LOG_INFO" "IPv${version} global interfaces found"
+      return 0
+    fi
+  elif is_command_available "ifconfig"; then
+    log "$LOG_WARN" "'ip' not available, falling back to ifconfig"
+    local grep_pattern
+    if [[ "$version" == "4" ]]; then
+      grep_pattern="inet "
+    else
+      grep_pattern="inet6"
+    fi
+    if ifconfig 2>/dev/null | grep -q "$grep_pattern"; then
+      log "$LOG_INFO" "IPv${version} interfaces found via ifconfig"
+      return 0
+    fi
+  else
+    log "$LOG_WARN" "Neither 'ip' nor 'ifconfig' available, skipping interface check"
     return 0
   fi
 
@@ -800,11 +841,11 @@ check_ip_connectivity() {
 
   log "$LOG_INFO" "Checking IPv${version} connectivity"
 
-  ping_cmd=($(get_ping_command "$version"))
+  mapfile -t ping_cmd < <(get_ping_command "$version")
 
   if [[ ${#ping_cmd[@]} -eq 0 ]]; then
-    log "$LOG_ERROR" "Ping command for IPv${version} is not available"
-    return 1
+    log "$LOG_WARN" "Ping not available, skipping IPv${version} connectivity check"
+    return 0
   fi
 
   if [[ "$version" == "4" ]]; then
@@ -1016,21 +1057,28 @@ spinner_start() {
   local delay=0.1
   # shellcheck disable=SC1003
   local spinstr='|/-\\'
-  local current_service
 
   spinner_running=true
 
   (
     while $spinner_running; do
       for ((i = 0; i < ${#spinstr}; i++)); do
-        current_service=""
+        local current_service="" progress_str=""
 
         if [[ -f "$SPINNER_SERVICE_FILE" ]]; then
           current_service="$(cat "$SPINNER_SERVICE_FILE")"
         fi
 
-        printf "\r\033[K%s %s %s" \
+        if [[ -n "${SPINNER_PROGRESS_FILE:-}" && -f "$SPINNER_PROGRESS_FILE" && "${SPINNER_TOTAL:-0}" -gt 0 ]]; then
+          local done_count
+          done_count=$(wc -c < "$SPINNER_PROGRESS_FILE" 2>/dev/null || echo 0)
+          done_count="${done_count// /}"
+          progress_str="[$done_count/$SPINNER_TOTAL] "
+        fi
+
+        printf "\r\033[K%s %s%s %s" \
           "$(color HEADER "${spinstr:$i:1}")" \
+          "$(color TABLE_HEADER "$progress_str")" \
           "$(color HEADER "Checking:")" \
           "$(color SERVICE "$current_service")"
 
@@ -1056,6 +1104,11 @@ spinner_stop() {
     rm -f "$SPINNER_SERVICE_FILE"
     unset SPINNER_SERVICE_FILE
   fi
+
+  if [[ -n "${SPINNER_PROGRESS_FILE:-}" && -f "$SPINNER_PROGRESS_FILE" ]]; then
+    rm -f "$SPINNER_PROGRESS_FILE"
+    unset SPINNER_PROGRESS_FILE
+  fi
 }
 
 spinner_update() {
@@ -1068,6 +1121,9 @@ spinner_update() {
 
 spinner_cleanup() {
   spinner_stop
+  local running_jobs
+  running_jobs=$(jobs -rp 2>/dev/null)
+  [[ -n "$running_jobs" ]] && kill $running_jobs 2>/dev/null
   exit 130
 }
 
@@ -1432,13 +1488,13 @@ process_custom_service() {
 run_service_group() {
   local group="$1"
   local services_string="${SERVICE_GROUPS[$group]}"
-  local is_custom=false
-  local is_cdn=false
-  local services_array service_name handler_func display_name result
+  local services_array service_name
+  local result_dir pids=()
 
   read -ra services_array <<<"$services_string"
+  result_dir=$(mktemp -d "${TMPDIR:-/tmp}/ipregion_results_XXXXXX")
 
-  log "$LOG_INFO" "Running $group group services"
+  log "$LOG_INFO" "Running $group group services (parallel)"
 
   for service_name in "${services_array[@]}"; do
     if printf "%s\n" "${EXCLUDED_SERVICES[@]}" | grep_wrapper -Fxq "$service_name"; then
@@ -1446,23 +1502,51 @@ run_service_group() {
       continue
     fi
 
-    case "$group" in
-      custom)
-        is_custom=true
-        ;;
-      cdn)
-        is_cdn=true
-        ;;
-    esac
+    if [[ -n "$SERVICE_FILTER" && "$service_name" != "$SERVICE_FILTER" ]]; then
+      continue
+    fi
 
-    if [[ "$is_custom" == true ]]; then
-      process_service "$service_name" true
-    elif [[ "$is_cdn" == true ]]; then
-      process_custom_service "$service_name"
-    else
-      process_service "$service_name"
+    local result_file="$result_dir/$service_name"
+    (
+      PARALLEL_RESULT_FILE="$result_file"
+      case "$group" in
+        custom) process_service "$service_name" true ;;
+        cdn)    process_custom_service "$service_name" ;;
+        *)      process_service "$service_name" ;;
+      esac
+      if [[ -n "${SPINNER_PROGRESS_FILE:-}" ]]; then
+        printf '.' >> "$SPINNER_PROGRESS_FILE"
+      fi
+    ) &
+    pids+=($!)
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+
+  # Collect results in original service order
+  for service_name in "${services_array[@]}"; do
+    if printf "%s\n" "${EXCLUDED_SERVICES[@]}" | grep_wrapper -Fxq "$service_name"; then
+      continue
+    fi
+    if [[ -n "$SERVICE_FILTER" && "$service_name" != "$SERVICE_FILTER" ]]; then
+      continue
+    fi
+    local f="$result_dir/$service_name"
+    if [[ -f "$f" ]]; then
+      local lines=()
+      mapfile -t lines < "$f"
+      local g="${lines[0]}" s="${lines[1]}" v4="${lines[2]}" v6="${lines[3]}"
+      case "$g" in
+        primary) ARR_PRIMARY+=("$s|||$v4|||$v6") ;;
+        custom)  ARR_CUSTOM+=("$s|||$v4|||$v6") ;;
+        cdn)     ARR_CDN+=("$s|||$v4|||$v6") ;;
+      esac
     fi
   done
+
+  rm -rf "$result_dir"
 }
 
 run_all_services() {
@@ -1549,6 +1633,11 @@ add_result() {
   ipv4=${ipv4//$'\t'/ }
   ipv6=${ipv6//$'\n'/}
   ipv6=${ipv6//$'\t'/ }
+
+  if [[ -n "${PARALLEL_RESULT_FILE:-}" ]]; then
+    printf '%s\n%s\n%s\n%s\n' "$group" "$service" "$ipv4" "$ipv6" > "$PARALLEL_RESULT_FILE"
+    return
+  fi
 
   case "$group" in
     primary) ARR_PRIMARY+=("$service|||$ipv4|||$ipv6") ;;
@@ -1644,6 +1733,7 @@ print_results() {
   fi
 
   print_header
+  print_consensus
 
   case "$GROUPS_TO_SHOW" in
     primary)
@@ -2059,8 +2149,99 @@ lookup_microsoft() {
   grep_wrapper --perl '"sRequestCountry":"\K[^"]*' <<<"$response"
 }
 
+load_config() {
+  local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ipregion.conf"
+  if [[ -f "$config_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$config_file"
+    log "$LOG_INFO" "Loaded config from $config_file"
+  fi
+}
+
+load_env() {
+  local env_file
+  for env_file in "./.env" "${XDG_CONFIG_HOME:-$HOME/.config}/ipregion.env"; do
+    if [[ -f "$env_file" ]]; then
+      set -a
+      # shellcheck source=/dev/null
+      source "$env_file"
+      set +a
+      log "$LOG_INFO" "Loaded env from $env_file"
+      break
+    fi
+  done
+}
+
+count_total_services() {
+  local total=0
+  local groups_to_count=()
+
+  case "$GROUPS_TO_SHOW" in
+    primary) groups_to_count=("primary") ;;
+    custom)  groups_to_count=("custom") ;;
+    cdn)     groups_to_count=("cdn") ;;
+    *)       groups_to_count=("primary" "custom" "cdn") ;;
+  esac
+
+  for group in "${groups_to_count[@]}"; do
+    local services_string="${SERVICE_GROUPS[$group]}"
+    local -a arr
+    read -ra arr <<<"$services_string"
+    for s in "${arr[@]}"; do
+      printf "%s\n" "${EXCLUDED_SERVICES[@]}" | grep_wrapper -Fxq "$s" && continue
+      [[ -n "$SERVICE_FILTER" && "$s" != "$SERVICE_FILTER" ]] && continue
+      ((total++))
+    done
+  done
+
+  echo "$total"
+}
+
+print_consensus() {
+  local -A counts=()
+  local total=0
+
+  for entry in "${ARR_PRIMARY[@]}"; do
+    local service="${entry%%|||*}"
+    local rest="${entry#*|||}"
+    local v4="${rest%%|||*}"
+    local v6="${rest##*|||}"
+
+    for code in "$v4" "$v6"; do
+      [[ -z "$code" ]] && continue
+      case "$code" in
+        "$STATUS_NA"|"$STATUS_DENIED"|"$STATUS_RATE_LIMIT"|"$STATUS_SERVER_ERROR"|"null"|"") continue ;;
+      esac
+      counts["$code"]=$((${counts["$code"]:-0} + 1))
+      ((total++))
+    done
+  done
+
+  [[ $total -eq 0 ]] && return
+
+  local max_count=0 consensus_code=""
+  for code in "${!counts[@]}"; do
+    if ((counts[$code] > max_count)); then
+      max_count=${counts[$code]}
+      consensus_code="$code"
+    fi
+  done
+
+  printf "%s: %s  (%d/%d GeoIP services agree)\n\n" \
+    "$(color HEADER 'Consensus')" \
+    "$(bold "$consensus_code")" \
+    "$max_count" \
+    "$total"
+}
+
 main() {
+  load_config
+  load_env
   parse_arguments "$@"
+
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    NO_COLOR_MODE=true
+  fi
 
   setup_debug
 
@@ -2070,6 +2251,8 @@ main() {
   install_dependencies
 
   if [[ "$JSON_OUTPUT" != "true" && "$VERBOSE" != "true" ]]; then
+    SPINNER_TOTAL=$(count_total_services)
+    SPINNER_PROGRESS_FILE=$(mktemp "${TMPDIR:-/tmp}/ipregion_progress_XXXXXX")
     spinner_start
   fi
 
