@@ -59,14 +59,19 @@ declare -A DEPENDENCIES=(
   [curl]="curl"
   [column]="util-linux"
   [nslookup]="bind-utils"
+  [ip]="iproute2"
+  [ping]="iputils"
 )
 
 declare -A PACKAGE_MAPPING=(
   ["apt:nslookup"]="dnsutils"
   ["apt:column"]="bsdmainutils"
+  ["apt:ping"]="iputils-ping"
   ["pacman:nslookup"]="bind"
   ["dnf:nslookup"]="bind-utils"
+  ["dnf:ip"]="iproute"
   ["yum:nslookup"]="bind-utils"
+  ["yum:ip"]="iproute"
   ["termux:column"]="util-linux"
 )
 
