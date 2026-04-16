@@ -76,6 +76,11 @@ declare -A PACKAGE_MAPPING=(
   ["yum:nslookup"]="bind-utils"
   ["yum:ip"]="iproute"
   ["termux:column"]="util-linux"
+  # macOS: these are built-in or handled via ifconfig/ping fallbacks
+  ["brew:ip"]=""
+  ["brew:ping"]=""
+  ["brew:column"]=""
+  ["brew:nslookup"]=""
 )
 
 declare -A PRIMARY_SERVICES=(
@@ -373,8 +378,17 @@ grep_wrapper() {
   local grep_args=()
 
   if [[ "$1" == "--perl" ]]; then
-    grep_args+=("-oP")
     shift
+    # macOS system grep lacks -P; use ggrep (brew install grep) or perl as fallback
+    if [[ "$OSTYPE" == "darwin"* ]] && ! is_command_available "ggrep"; then
+      local pattern="$1"; shift
+      perl -ne 'print "$&\n" while /'"$pattern"'/g' "$@"
+      return
+    fi
+    local grep_bin="grep"
+    is_command_available "ggrep" && grep_bin="ggrep"
+    "$grep_bin" -oP "$@"
+    return
   fi
 
   grep "${grep_args[@]}" "$@"
@@ -419,6 +433,10 @@ is_command_available() {
 }
 
 detect_distro() {
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    distro="macos"
+    return
+  fi
   if [[ -f /etc/os-release ]]; then
     source /etc/os-release
     distro="$ID"
@@ -455,6 +473,13 @@ detect_package_manager() {
     alpine)
       pkg_manager="apk"
       ;;
+    macos)
+      if is_command_available "brew"; then
+        pkg_manager="brew"
+      else
+        error_exit "Homebrew not found. Install it from https://brew.sh"
+      fi
+      ;;
     *)
       error_exit "Unknown distro: $distro"
       ;;
@@ -480,7 +505,8 @@ get_package_name() {
   local command="$2"
   local mapping_key="${pkg_manager}:${command}"
 
-  if [[ -n "${PACKAGE_MAPPING[$mapping_key]}" ]]; then
+  # Use +_ to detect key existence even when value is empty (empty = skip install)
+  if [[ "${PACKAGE_MAPPING[$mapping_key]+_}" == "_" ]]; then
     echo "${PACKAGE_MAPPING[$mapping_key]}"
     return
   fi
@@ -513,6 +539,9 @@ get_install_args() {
     apk)
       install_args=("add" "--no-cache")
       ;;
+    brew)
+      install_args=("install")
+      ;;
   esac
 
   echo "${install_args[@]}"
@@ -525,7 +554,8 @@ install_packages() {
   local cmd_prefix=()
   local install_cmd=()
 
-  if is_sudo_required; then
+  # brew must never be run via sudo
+  if [[ "$pkg_manager" != "brew" ]] && is_sudo_required; then
     cmd_prefix=("sudo")
     log "$LOG_INFO" "Running as non-root user, using sudo"
   fi
@@ -597,8 +627,14 @@ install_dependencies() {
 
   for cmd in "${missing_commands[@]}"; do
     package_name=$(get_package_name "$pkg_manager" "$cmd")
+    [[ -z "$package_name" ]] && continue  # empty = system-native, skip
     missing_dependencies+=("$package_name")
   done
+
+  if [[ ${#missing_dependencies[@]} -eq 0 ]]; then
+    log "$LOG_INFO" "All missing commands have system-native fallbacks, no install needed"
+    return 0
+  fi
 
   log "$LOG_INFO" "Missing dependencies: ${missing_dependencies[*]}"
 
@@ -1227,7 +1263,7 @@ curl_wrapper() {
 
   response_with_code=$(curl "${curl_args[@]}")
   http_code=$(tail -n1 <<<"$response_with_code")
-  response=$(head -n -1 <<<"$response_with_code")
+  response=$(sed '$d' <<<"$response_with_code")
 
   if [[ "$http_code" == 4* || "$http_code" == 5* ]]; then
     status_from_http_code "$http_code"
