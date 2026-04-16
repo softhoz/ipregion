@@ -1893,35 +1893,124 @@ lookup_youtube() {
   process_json "$json_result" ".[0][2][0][0][1]"
 }
 
+fetch_twitch_client_id() {
+  local page client_id
+  log "$LOG_INFO" "Fetching fresh Twitch Client ID from twitch.tv"
+
+  page=$(curl -sf --compressed --max-time 10 -A "$USER_AGENT" "https://www.twitch.tv/") || return 1
+  client_id=$(echo "$page" | grep_wrapper --perl '"Client-ID":"?\K[a-z0-9]+')
+  [[ -z "$client_id" ]] && \
+    client_id=$(echo "$page" | grep_wrapper --perl 'clientId[=:]["'"'"']?\K[a-z0-9]+')
+  [[ -z "$client_id" ]] && return 1
+
+  TWITCH_CLIENT_ID="$client_id"
+  log "$LOG_INFO" "Twitch Client ID refreshed successfully"
+}
+
 lookup_twitch() {
   local ip_version="$1"
-  local response
+  local response result
+  local gql_payload='[{"operationName":"VerifyEmail_CurrentUser","variables":{},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"f9e7dcdf7e99c314c82d8f7f725fab5f99d1df3d7359b53c9ae122deec590198"}}}]'
 
   response=$(curl_wrapper POST "https://gql.twitch.tv/gql" \
     --header "Client-Id: $TWITCH_CLIENT_ID" \
-    --json '[{"operationName":"VerifyEmail_CurrentUser","variables":{},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"f9e7dcdf7e99c314c82d8f7f725fab5f99d1df3d7359b53c9ae122deec590198"}}}]' \
+    --json "$gql_payload" \
     --ip-version "$ip_version")
-  process_json "$response" ".[0].data.requestInfo.countryCode"
+
+  result=$(process_json "$response" ".[0].data.requestInfo.countryCode")
+
+  if [[ -n "$result" && "$result" != "null" ]] && ! is_status_string "$result"; then
+    echo "$result"
+    return
+  fi
+
+  # Client ID may be stale — refresh and retry once
+  if ! is_status_string "$response" && fetch_twitch_client_id 2>/dev/null; then
+    response=$(curl_wrapper POST "https://gql.twitch.tv/gql" \
+      --header "Client-Id: $TWITCH_CLIENT_ID" \
+      --json "$gql_payload" \
+      --ip-version "$ip_version")
+    process_json "$response" ".[0].data.requestInfo.countryCode"
+    return
+  fi
+
+  echo "$result"
+}
+
+fetch_chatgpt_statsig_key() {
+  local page key
+  log "$LOG_INFO" "Fetching fresh ChatGPT Statsig API key from chatgpt.com"
+
+  page=$(curl -sf --compressed --max-time 10 -A "$USER_AGENT" "https://chatgpt.com/") || return 1
+  key=$(echo "$page" | grep_wrapper --perl 'client-[A-Za-z0-9]{20,}')
+  [[ -z "$key" ]] && return 1
+
+  CHATGPT_STATSIG_API_KEY="$key"
+  log "$LOG_INFO" "ChatGPT Statsig key refreshed successfully"
 }
 
 lookup_chatgpt() {
   local ip_version="$1"
-  local response
+  local response result
 
   response=$(curl_wrapper POST "https://ab.chatgpt.com/v1/initialize" --ip-version "$ip_version" \
     --header "Statsig-Api-Key: $CHATGPT_STATSIG_API_KEY")
-  process_json "$response" ".derived_fields.country"
+
+  result=$(process_json "$response" ".derived_fields.country")
+
+  if [[ -n "$result" && "$result" != "null" ]] && ! is_status_string "$result"; then
+    echo "$result"
+    return
+  fi
+
+  # Statsig key may be stale — refresh and retry once
+  if ! is_status_string "$response" && fetch_chatgpt_statsig_key 2>/dev/null; then
+    response=$(curl_wrapper POST "https://ab.chatgpt.com/v1/initialize" --ip-version "$ip_version" \
+      --header "Statsig-Api-Key: $CHATGPT_STATSIG_API_KEY")
+    process_json "$response" ".derived_fields.country"
+    return
+  fi
+
+  echo "$result"
+}
+
+fetch_netflix_token() {
+  local page bundle_url bundle token
+  log "$LOG_INFO" "Fetching fresh Netflix API token from fast.com"
+
+  page=$(curl -sf --compressed --max-time 10 -A "$USER_AGENT" "https://fast.com/") || return 1
+  bundle_url=$(echo "$page" | grep_wrapper --perl '/app-[a-f0-9]+\.js')
+  [[ -z "$bundle_url" ]] && return 1
+
+  bundle=$(curl -sf --compressed --max-time 15 "https://fast.com${bundle_url}") || return 1
+  token=$(echo "$bundle" | grep_wrapper --perl 'token:"\K[A-Za-z0-9+/=_-]+')
+  [[ -z "$token" ]] && return 1
+
+  NETFLIX_API_KEY="$token"
+  log "$LOG_INFO" "Netflix API token refreshed successfully"
 }
 
 lookup_netflix() {
   local ip_version="$1"
-  local response
+  local response result
 
   response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
 
   if is_valid_json "$response"; then
-    process_json "$response" ".client.location.country"
-    return
+    result=$(process_json "$response" ".client.location.country")
+    if [[ -n "$result" && "$result" != "null" ]]; then
+      echo "$result"
+      return
+    fi
+  fi
+
+  # Token may be stale — refresh from fast.com and retry once
+  if ! is_status_string "$response" && fetch_netflix_token 2>/dev/null; then
+    response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
+    if is_valid_json "$response"; then
+      process_json "$response" ".client.location.country"
+      return
+    fi
   fi
 
   echo "$response"
@@ -2142,15 +2231,28 @@ lookup_youtube_cdn() {
 
 lookup_netflix_cdn() {
   local ip_version="$1"
-  local response
+  local response result
 
   response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
 
   if is_valid_json "$response"; then
-    process_json "$response" ".targets[0].location.country"
-  else
-    echo ""
+    result=$(process_json "$response" ".targets[0].location.country")
+    if [[ -n "$result" && "$result" != "null" ]]; then
+      echo "$result"
+      return
+    fi
   fi
+
+  # Token may be stale — refresh and retry once (reuses fetch_netflix_token)
+  if ! is_status_string "$response" && fetch_netflix_token 2>/dev/null; then
+    response=$(curl_wrapper GET "https://api.fast.com/netflix/speedtest/v2?https=true&token=$NETFLIX_API_KEY&urlCount=1" --ip-version "$ip_version")
+    if is_valid_json "$response"; then
+      process_json "$response" ".targets[0].location.country"
+      return
+    fi
+  fi
+
+  echo ""
 }
 
 lookup_ookla_speedtest() {
